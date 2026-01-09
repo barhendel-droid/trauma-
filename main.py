@@ -45,7 +45,10 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 # --- HELPERS ---
 def _clean_id(user_id):
     if not user_id: return ""
-    return "".join(filter(str.isdigit, str(user_id)))
+    return str(user_id).replace("@g.us", "").replace("@s.whatsapp.net", "").strip()
+
+def is_group(chat_id):
+    return "@g.us" in str(chat_id) or "-" in str(chat_id)
 
 def _first_word(s):
     if not s: return ""
@@ -267,16 +270,15 @@ def generate_progress_graph(user_id, days=14):
     df['hrv_plot'] = np.nan
     for col in possible_hrv_cols:
         if col in df.columns:
+            # Ensure numeric conversion
+            df[col] = pd.to_numeric(df[col], errors='coerce')
             df['hrv_plot'] = df['hrv_plot'].fillna(df[col])
     
-    # Don't plot zeros for HRV, keep them as NaN so they don't appear on graph
-    df.loc[df['hrv_plot'] <= 0, 'hrv_plot'] = np.nan
-    
     # Energy: 1-5 -> 20-100
-    df['energy_plot'] = df.get('survey_1', pd.Series([0]*len(df))).fillna(0) * 20
+    df['energy_plot'] = pd.to_numeric(df.get('survey_1', pd.Series([np.nan]*len(df))), errors='coerce').fillna(0) * 20
 
     # Load: Scale down if very high to keep proportions
-    raw_load = df.get('training_load', pd.Series([0]*len(df))).fillna(0)
+    raw_load = pd.to_numeric(df.get('training_load', pd.Series([0]*len(df))), errors='coerce').fillna(0)
     max_load = raw_load.max()
     load_label = 'Training Load'
     if max_load > 150:
@@ -289,9 +291,20 @@ def generate_progress_graph(user_id, days=14):
     plt.figure(figsize=(10, 6))
     plt.grid(True, linestyle='--', alpha=0.6)
     
-    plt.plot(df['date'], df['hrv_plot'], marker='o', label='Recovery (HRV)', color='#2ecc71', linewidth=2.5)
+    # Plot HRV only where it's > 0
+    hrv_data = df[df['hrv_plot'] > 0]
+    if not hrv_data.empty:
+        plt.plot(hrv_data['date'], hrv_data['hrv_plot'], marker='o', label='Recovery (HRV)', color='#2ecc71', linewidth=2.5)
+    
+    # Plot Sleep
     plt.plot(df['date'], df['sleep_plot'], marker='s', label='Sleep Quality (scaled)', color='#3498db', linewidth=2.5)
-    plt.plot(df['date'], df['energy_plot'], marker='D', label='Energy Level (1-5)', color='#9b59b6', linewidth=2.5)
+    
+    # Plot Energy
+    energy_data = df[df['energy_plot'] > 0]
+    if not energy_data.empty:
+        plt.plot(energy_data['date'], energy_data['energy_plot'], marker='D', label='Energy Level (1-5)', color='#9b59b6', linewidth=2.5)
+    
+    # Plot Load
     plt.plot(df['date'], df['load_plot'], marker='^', label=load_label, color='#e74c3c', linestyle=':', linewidth=2)
     
     plt.title('Your Progress Report', fontsize=18, pad=20, fontweight='bold')
@@ -366,6 +379,7 @@ def get_emergency_list(body_text="בחר/י את האופציה המתאימה �
         {"id": "action_breath", "title": "🧘 תרגיל נשימה", "description": "נשימת 4-7-8 להרגעה"},
         {"id": "action_ground", "title": "⚓ תרגיל קרקוע", "description": "טכניקת 5-4-3-2-1"},
         {"id": "action_workout", "title": "💪 אימון מותאם", "description": "אימון לפי המדדים שלך"},
+        {"id": "action_community", "title": "🤝 הקהילה שלנו", "description": "מה קורה בקהילה שלנו"},
         {"id": "action_fine", "title": "✅ הכל בסדר", "description": "אני מרגיש/ה יותר טוב"}
     ]
     
@@ -396,6 +410,67 @@ def get_emergency_list(body_text="בחר/י את האופציה המתאימה �
             ]
         }
     }
+
+def get_community_menu():
+    """Returns a menu for community features."""
+    return {
+        "type": "list",
+        "header": {"type": "text", "text": "הקהילה שלנו 🤝"},
+        "body": {"text": "כאן אפשר לראות מה קורה בקהילה, למצוא שותף/ה או להצטרף לקבוצה:"},
+        "footer": {"text": "Deep-Rest Guard"},
+        "action": {
+            "button": "בחר אפשרות",
+            "sections": [
+                {
+                    "title": "הקהילה שלי",
+                    "rows": [
+                        {"id": "comm_stats", "title": "📊 כמה תרגלנו היום?", "description": "סטטיסטיקה קבוצתית אנונימית"},
+                        {"id": "comm_join_group", "title": "📢 הצטרפות לקבוצה", "description": "מעבר לקבוצת הקהילה בוואטסאפ"},
+                        {"id": "comm_find_partner", "title": "🤝 חפש שותף/ה", "description": "חיבור למשתמש אחר לשיחה או אימון"},
+                        {"id": "comm_opt_out", "title": "🔕 הפסקת זמינות", "description": "הסרת הפרופיל מחיפוש שותפים"}
+                    ]
+                }
+            ]
+        }
+    }
+
+def find_community_partner(sender_id):
+    """Finds a random partner who opted-in, excluding the sender."""
+    query = db.collection("users").where("partner_opt_in", "==", True).limit(10).get()
+    potential_partners = [u for u in query if u.id != _clean_id(sender_id)]
+    if not potential_partners: return None
+    import random
+    return random.choice(potential_partners).to_dict(), random.choice(potential_partners).id
+
+def log_community_action(user_id, action_type):
+    """Logs a specific regulation action with a timestamp."""
+    db.collection("community_actions").add({
+        "user_id": _clean_id(user_id),
+        "action": action_type,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
+
+def get_community_message(u_name):
+    """Generates a community message based on actions in the last 24 hours."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    yesterday = now - datetime.timedelta(hours=24)
+    
+    # Query actions in the last 24h
+    actions_ref = db.collection("community_actions").where("timestamp", ">", yesterday).get()
+    actions_count = len(actions_ref)
+    
+    # Count unique active users in last 24h
+    active_users = set()
+    for doc in actions_ref:
+        active_users.add(doc.to_dict().get("user_id"))
+    
+    users_count = len(active_users)
+    if users_count == 0:
+        users_count = len(db.collection("users").get()) # Fallback to total users
+        
+    minutes = actions_count * 5 # Estimate 5 mins per action
+    
+    return f"היי {u_name}, את/ה לא לבד. 🤍\n\nב-24 השעות האחרונות, בקהילה שלנו היו *{users_count} חברים* פעילים. יחד איתך, נעשו *{actions_count} תרגולים*, שהם בערך *{minutes} דקות* של שקט. ✨\n\nכל פעם שאת/ה מתרגל/ת, זה חלק מהמאמץ של כולנו. טוב שאת/ה כאן! ⚓"
 
 def get_user_doc(user_id):
     return db.collection("users").document(_clean_id(user_id)).get().to_dict() or {}
@@ -457,15 +532,18 @@ def fetch_intervals_data(user_id):
         for entry in wellness_data:
             entry_id = entry.get("id")
             if entry_id:
+                # Normalize HRV key BEFORE saving to history
+                hrv_val = entry.get("hrv") or entry.get("hrv_sdnn") or entry.get("rmssd")
+                if hrv_val: entry["hrv_consistent"] = hrv_val
+                
                 # Store in history subcollection
                 hist_ref = db.collection("users").document(doc_id).collection("wellness_history").document(str(entry_id))
                 batch.set(hist_ref, entry, merge=True)
             
-            # Look for ANY form of HRV
-            hrv_val = entry.get("hrv") or entry.get("hrv_sdnn") or entry.get("rmssd")
+            # Check for latest valid record
+            hrv_val = entry.get("hrv_consistent")
             rhr_val = entry.get("restingHR") or entry.get("resting_hr")
             if hrv_val or rhr_val:
-                if hrv_val: entry["hrv_consistent"] = hrv_val
                 wellness = entry
         batch.commit()
         print(f"DEBUG: Saved {len(wellness_data)} entries to history for {doc_id}")
@@ -531,7 +609,49 @@ def fetch_intervals_data(user_id):
     }
 
 # --- AI LOGIC ---
-def get_ai_reply(text, data, mode="chat", audio_bytes=None):
+def get_group_pulse(group_id):
+    """Calculates anonymized group averages for today."""
+    members = db.collection("users").where("group_id", "==", group_id).get()
+    moods = []
+    energies = []
+    
+    today_str = datetime.date.today().isoformat()
+    for m in members:
+        # Check today's wellness history for each member
+        hist = db.collection("users").document(m.id).collection("wellness_history").document(today_id).get()
+        if hist.exists:
+            d = hist.to_dict()
+            if "survey_0" in d: moods.append(d["survey_0"])
+            if "survey_1" in d: energies.append(d["survey_1"])
+            
+    if not moods: return None
+    
+    avg_mood = sum(moods) / len(moods)
+    avg_energy = sum(energies) / len(energies)
+    
+    weather = "שקט ☀️" if avg_mood > 4 else "מעורפל 🌫️" if avg_mood > 2.5 else "סוער ⛈️"
+    
+    return f"🌊 *דופק קבוצתי יומי* ⚓\n\nמדד האנרגיה הממוצע שלנו: {round(avg_energy, 1)}/5\nמזג האוויר הפנימי המשותף: {weather}\n\nזה זמן מצוין לקחת רגע לנשימה משותפת. אתם לא לבד. 🤍"
+
+def notify_admin_if_needed(user_id, data):
+    """Notifies group admin if a user shows extreme distress."""
+    user_doc = db.collection("users").document(_clean_id(user_id)).get().to_dict() or {}
+    group_id = user_doc.get("group_id")
+    if not group_id: return
+    
+    group_doc = db.collection("groups").document(group_id).get().to_dict() or {}
+    admin_phone = group_doc.get("admin_phone")
+    if not admin_phone: return
+    
+    # Distress Criteria: Mood = 1 OR HRV drop > 30%
+    mood = user_doc.get("pcl5_responses", {}).get("0") # Mood is first question
+    hrv = data.get("hrv")
+    
+    if mood == "1" or (isinstance(hrv, (int, float)) and hrv < 20):
+        alert = f"⚠️ *התראת חוסן למנהל* ⚠️\n\nהמשתמש {user_doc.get('name')} בסיכון או הצפה.\nמדד HRV: {hrv}\nדיווח מצב רוח: 1/5\n\nכדאי ליצור קשר אישי בהקדם. ✨"
+        send_wa(admin_phone, alert)
+
+def get_ai_reply(text, data, mode="chat", audio_bytes=None, is_group_msg=False):
     # הכנת מידע על הפעילות האחרונה
     last_act = data.get('last_activity')
     act_info = "No recent activities found"
@@ -589,8 +709,21 @@ def get_ai_reply(text, data, mode="chat", audio_bytes=None):
     else:
         task_desc = "Standard Chat Mode. Provide warm, insightful analysis."
 
-    prompt = f"""
-    Role: אסיסטנט חכם, אנושי ורגיש בשם Deep-Rest Guard.
+    if is_group_msg:
+        prompt = f"""
+        Role: מנחה קבוצתי חכם ורגיש בתוך קבוצת וואטסאפ של פוסט-טראומה.
+        Task: Analyze the group message: "{text}"
+        Instructions:
+        1. If the message is intense, triggering, or shows extreme distress, intervene gently.
+        2. Remind the group to breathe or take a moment of silence if needed.
+        3. Keep the space safe and supportive.
+        4. NEVER name specific users or their personal medical data in the group.
+        5. Hebrew only, empathetic and calm tone. 
+        JSON Output Format: {{ "reply": "YOUR_MESSAGE_HERE" }}
+        """
+    else:
+        prompt = f"""
+        Role: אסיסטנט חכם, אנושי ורגיש בשם Deep-Rest Guard.
     User Gender: {data.get('gender')} (IMPORTANT: If female, use feminine Hebrew. If male, use masculine Hebrew).
     
     DATA FOR ANALYSIS (Only if relevant):
@@ -690,6 +823,19 @@ def whatsapp_bot(request):
                 report = generate_weekly_report(u_id)
                 if report:
                     send_wa(u_id, report)
+            
+            elif task == "group_pulse":
+                # Triggered via ?task=group_pulse&group_id=...
+                g_id = request.args.get("group_id")
+                if g_id:
+                    pulse_msg = get_group_pulse(g_id)
+                    if pulse_msg: send_wa(g_id, pulse_msg)
+            
+            elif task == "group_regulation":
+                g_id = request.args.get("group_id")
+                if g_id:
+                    reg_msg = "🧘 *זמן ויסות קבוצתי* ⚓\n\nאני מזמין את כולכם לעצור לרגע. נסו לבצע 4 מחזורי נשימה של 4-7-8 יחד עכשיו. מי שסיים שיסמן ב-✅."
+                    send_wa(g_id, reg_msg)
         
         return "Tasks triggered", 200
 
@@ -810,9 +956,41 @@ def whatsapp_bot(request):
                 if inter_type == "list_reply":
                     selection_id = msg["interactive"]["list_reply"]["id"]
                     # Map selection to keywords to reuse existing logic
-                    if selection_id == "action_breath": text = "נשימה"
-                    elif selection_id == "action_ground": text = "קרקוע"
-                    elif selection_id == "action_workout": text = "אימון"
+                    if selection_id == "action_breath": 
+                        text = "נשימה"
+                        log_community_action(sender, "breath")
+                    elif selection_id == "action_ground": 
+                        text = "קרקוע"
+                        log_community_action(sender, "ground")
+                    elif selection_id == "action_workout": 
+                        text = "אימון"
+                        log_community_action(sender, "workout")
+                    elif selection_id == "action_community":
+                        send_wa(sender, "ברוך הבא למרכז הקהילתי של השבט. ✨", interactive_list=get_community_menu())
+                        return "OK", 200
+                    elif selection_id == "comm_stats":
+                        u_name = user_doc.get("name", "חבר")
+                        send_wa(sender, get_community_message(u_name))
+                        return "OK", 200
+                    elif selection_id == "comm_join_group":
+                        link = "https://chat.whatsapp.com/KTYfxOQGtV9ATDroVrs5gT"
+                        send_wa(sender, f"שמחים שאת/ה מצטרף/ת אלינו! 🤍\nהנה הקישור לקבוצה שלנו:\n{link}")
+                        return "OK", 200
+                    elif selection_id == "comm_find_partner":
+                        # Opt-in logic
+                        db.collection("users").document(_clean_id(sender)).set({"partner_opt_in": True}, merge=True)
+                        partner = find_community_partner(sender)
+                        if partner:
+                            p_doc, p_id = partner
+                            p_name = p_doc.get("name", "חבר מהקהילה")
+                            send_wa(sender, f"מצאתי חבר/ה מהשבט שזמין/ה לחיבור! 🤝\nהשם: *{p_name}*\nאפשר לכתוב לו/לה כאן: https://wa.me/{p_id}\n\n(גם הפרופיל שלך הפך לזמין כרגע לחיפוש)")
+                        else:
+                            send_wa(sender, "כרגע אין חברים פנויים נוספים, אבל הפכתי את הפרופיל שלך לזמין לחיבור. ברגע שמישהו יחפש שותף, הוא יוכל למצוא אותך! ✨")
+                        return "OK", 200
+                    elif selection_id == "comm_opt_out":
+                        db.collection("users").document(_clean_id(sender)).set({"partner_opt_in": False}, merge=True)
+                        send_wa(sender, "הפרופיל שלך הוסר מרשימת החיפוש. תמיד אפשר לחזור ולהצטרף שוב! 🌿")
+                        return "OK", 200
                     elif selection_id == "action_fine": text = "בסדר"
                     elif selection_id.startswith("graph_"):
                         days = int(selection_id.split("_")[1])
@@ -1100,11 +1278,19 @@ def whatsapp_bot(request):
 
             try:
                 intervals_data = fetch_intervals_data(sender)
-                reply = get_ai_reply(text, intervals_data, audio_bytes=audio_bytes)
                 
-                # Use the interactive list for EVERY AI reply as requested
-                e_name = user_doc.get("emergency_name")
-                send_wa(sender, reply, interactive_list=get_emergency_list(body_text=reply, emergency_name=e_name))
+                # Check if admin notification is needed
+                notify_admin_if_needed(sender, intervals_data)
+                
+                reply = get_ai_reply(text, intervals_data, audio_bytes=audio_bytes, is_group_msg=is_group(sender))
+                
+                if is_group(sender):
+                    # In group, don't show the personal help list unless specifically requested
+                    send_wa(sender, reply)
+                else:
+                    # Use the interactive list for EVERY AI reply as requested
+                    e_name = user_doc.get("emergency_name")
+                    send_wa(sender, reply, interactive_list=get_emergency_list(body_text=reply, emergency_name=e_name))
             except Exception as e:
                 if "User not connected" in str(e):
                     send_wa(sender, f"היי {user_doc.get('name', 'חבר')}, אני עדיין לא מכיר את המדדים שלך. ✨ שלח 'חבר' כדי שנתחבר יחד.")
