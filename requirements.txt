@@ -2,3 +2,6 @@ functions-framework==3.*
 firebase-admin>=6.5.0
 google-genai>=0.3.0
 requests>=2.32.0
+matplotlib>=3.8.0
+pandas>=2.1.0
+numpy>=1.26.0
