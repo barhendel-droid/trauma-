@@ -1025,11 +1025,16 @@ def whatsapp_bot(request):
                         e_name = user_doc.get("emergency_name")
                         e_phone = user_doc.get("emergency_phone")
                         if e_phone:
-                            # Use E.164 format for the link
+                            # 1. Activate Emergency Mode for 15 minutes
+                            doc_id = _clean_id(sender)
+                            expiry = (datetime.datetime.now() + datetime.timedelta(minutes=15)).isoformat()
+                            db.collection("users").document(doc_id).set({"emergency_mode_expiry": expiry}, merge=True)
+                            
+                            # 2. Send Alert
                             sender_clean = sender.replace("+", "")
                             alert_msg = f"⚓ הודעה מ-Deep-Rest Guard: {u_name} ביקש/ה לעדכן אותך שהוא/היא נמצא/ת ברגע של עומס רגשי וזקוק/ה לתמיכה. כדאי ליצור קשר בהקדם. 🤍\n\nליצירת קשר מהיר:\nhttps://wa.me/{sender_clean}"
                             send_wa(e_phone, alert_msg)
-                            send_wa(sender, f"שלחתי הודעה דחופה ל{e_name}. ✨\n\nאם תרצה/י לשלוח לו/לה גם את המיקום המדויק שלך, פשוט שלח/י לי את המיקום כאן (דרך סימן ה-📎 בוואטסאפ) ואני אעביר אותו מיד. 📍")
+                            send_wa(sender, f"שלחתי הודעה דחופה ל{e_name}. ✨\n\nב-15 הדקות הקרובות, כל תמונה, מיקום או הקלטה שתשלח/י לי כאן יועברו אליו/אליה מיד כדי שיוכלו לעזור. 📍🖼️🎤")
                         else:
                             send_wa(sender, "לא הגדרת מספר טלפון לאיש קשר לחירום. 🌿")
                         return "OK", 200
@@ -1127,10 +1132,17 @@ def whatsapp_bot(request):
                 e_phone = user_doc.get("emergency_phone")
                 e_name = user_doc.get("emergency_name", "איש הקשר")
                 u_name = user_doc.get("name", "חבר")
-                if e_phone and image_id:
+                
+                # Check if Emergency Mode is active
+                emergency_expiry = user_doc.get("emergency_mode_expiry")
+                is_emergency = emergency_expiry and datetime.datetime.fromisoformat(emergency_expiry) > datetime.datetime.now()
+                
+                if is_emergency and e_phone and image_id:
                     send_wa(e_phone, f"🖼️ *תמונה דחופה* מ-{u_name}:")
                     send_wa_image(e_phone, image_id)
                     send_wa(sender, f"התמונה נשלחה ל{e_name}. ⚓")
+                else:
+                    send_wa(sender, "קיבלתי את התמונה, תודה. ✨")
                 return "OK", 200
             elif msg_type == "audio" or msg_type == "voice":
                 media_id = msg.get("audio", {}).get("id") or msg.get("voice", {}).get("id")
@@ -1138,13 +1150,17 @@ def whatsapp_bot(request):
                 e_name = user_doc.get("emergency_name", "איש הקשר")
                 u_name = user_doc.get("name", "חבר")
                 
-                # 1. Forward to emergency contact if exists
-                if e_phone and media_id:
+                # Check if Emergency Mode is active
+                emergency_expiry = user_doc.get("emergency_mode_expiry")
+                is_emergency = emergency_expiry and datetime.datetime.fromisoformat(emergency_expiry) > datetime.datetime.now()
+                
+                # 1. Forward to emergency contact ONLY if in emergency mode
+                if is_emergency and e_phone and media_id:
                     send_wa(e_phone, f"🎤 *הקלטה דחופה* מ-{u_name}:")
                     send_wa_audio(e_phone, media_id)
                     send_wa(sender, f"ההקלטה נשלחה ל{e_name}. ⚓")
                 
-                # 2. Process for AI (existing logic)
+                # 2. Process for AI (always do this for personal support)
                 if media_id:
                     print(f"Downloading voice note {media_id} for AI analysis...")
                     audio_bytes = download_wa_media(media_id)
