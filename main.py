@@ -34,13 +34,32 @@ def _first_word(s):
         return f"i{word}"
     return word
 
+def download_wa_media(media_id):
+    """מוריד קובץ מדיה (אודיו) מוואטסאפ ומחזיר את הביטים שלו."""
+    headers = {"Authorization": f"Bearer {WA_TOKEN}"}
+    try:
+        # 1. קבלת URL להורדה
+        res = requests.get(f"https://graph.facebook.com/v21.0/{media_id}", headers=headers, timeout=10)
+        if res.status_code != 200: return None
+        download_url = res.json().get("url")
+        
+        # 2. הורדת הקובץ בפועל
+        res = requests.get(download_url, headers=headers, timeout=15)
+        if res.status_code == 200:
+            return res.content
+    except Exception as e:
+        print(f"Error downloading media: {e}")
+    return None
+
 def send_wa(to, body):
     to_clean = _clean_id(to)
-    print(f"SENDING WA to {to_clean}: {body[:50]}...")
+    # הגנה מפני הודעה ריקה או לא תקינה
+    body_str = str(body) if body else "אני מעבד את הנתונים..."
+    print(f"SENDING WA to {to_clean}: {body_str[:50]}...")
     try:
         res = requests.post(
             f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages",
-            json={"messaging_product": "whatsapp", "to": to_clean, "type": "text", "text": {"body": body}},
+            json={"messaging_product": "whatsapp", "to": to_clean, "type": "text", "text": {"body": body_str}},
             headers={"Authorization": f"Bearer {WA_TOKEN}"}, timeout=10
         )
         print(f"WA STATUS: {res.status_code}, RESPONSE: {res.text}")
@@ -50,7 +69,7 @@ def send_wa(to, body):
 def get_user_doc(user_id):
     return db.collection("users").document(_clean_id(user_id)).get().to_dict() or {}
 
-def set_user_credentials(user_id, api_key, athlete_id, name=None):
+def set_user_credentials(user_id, api_key, athlete_id, name=None, emergency_name=None, emergency_phone=None):
     # ניקוי יסודי - לוקחים רק את המילה הראשונה ומנקים תווים לא רצויים
     clean_key = _first_word(api_key)
     clean_id = _first_word(athlete_id)
@@ -61,11 +80,11 @@ def set_user_credentials(user_id, api_key, athlete_id, name=None):
         "intervals_athlete_id": clean_id,
         "connected_at": firestore.SERVER_TIMESTAMP
     }
-    if name:
-        data["name"] = name.strip()
+    if name: data["name"] = name.strip()
+    if emergency_name: data["emergency_name"] = emergency_name.strip()
+    if emergency_phone: data["emergency_phone"] = _clean_id(emergency_phone)
     
-    print(f"SAVING CREDENTIALS: user_id={user_id} -> doc_id={doc_id}, athlete_id={clean_id}, name={name}")
-    
+    print(f"SAVING CREDENTIALS: user_id={user_id}, athlete_id={clean_id}, emergency={emergency_name}")
     db.collection("users").document(doc_id).set(data, merge=True)
 
 # --- INTERVALS.ICU LOGIC ---
@@ -128,18 +147,27 @@ def fetch_intervals_data(user_id):
     try:
         url = f"https://intervals.icu/api/v1/athlete/{athlete_id}/activities"
         print(f"DEBUG: Fetching activities from {url}...")
-        res = requests.get(url, auth=auth, params={'limit': 1}, timeout=15)
+        # הוספת טווח תאריכים למניעת שגיאת 422
+        res = requests.get(url, auth=auth, params={'oldest': oldest, 'newest': newest, 'limit': 1}, timeout=15)
         print(f"DEBUG: Activities status: {res.status_code}")
         if res.status_code == 200:
             acts = res.json()
-            if acts and isinstance(acts, list): 
+            if acts and isinstance(acts, list) and len(acts) > 0: 
                 last_activity = acts[0]
                 print(f"DEBUG: Found last activity: {last_activity.get('name')}")
+        else:
+            print(f"DEBUG: Activities error response: {res.text}")
     except Exception as e:
         print(f"DEBUG: Activities exception: {e}")
 
+    today_str = datetime.date.today().isoformat()
+    dismissed = user_doc.get("intervention_dismissed_at") == today_str
+
     return {
         "user_name": user_doc.get("name", "חבר"),
+        "emergency_name": user_doc.get("emergency_name"),
+        "emergency_phone": user_doc.get("emergency_phone"),
+        "intervention_dismissed": dismissed,
         "hrv": wellness.get("hrv", "N/A"),
         "resting_hr": wellness.get("restingHR", "N/A"),
         "stress": wellness.get("stressScore", "N/A"),
@@ -150,7 +178,7 @@ def fetch_intervals_data(user_id):
     }
 
 # --- AI LOGIC ---
-def get_ai_reply(text, data):
+def get_ai_reply(text, data, mode="chat", audio_bytes=None):
     # הכנת מידע על הפעילות האחרונה
     last_act = data.get('last_activity')
     act_info = "No recent activities found"
@@ -159,52 +187,165 @@ def get_ai_reply(text, data):
 
     # הכנת היסטוריה למודל
     history_str = ""
-    for h in data.get('history', []):
+    history_data = data.get('history', [])
+    for h in history_data:
         history_str += f"- Date {h.get('id')}: HRV {h.get('hrv', 'N/A')}, RHR {h.get('restingHR', 'N/A')}, Sleep {round(h.get('sleepSecs',0)/3600,1) if h.get('sleepSecs') else 'N/A'}h\n"
 
-    prompt = f"""
-    You are a trauma-informed emotional regulation coach and physiology expert.
+    # קטלוג אימונים מלא ומפורט
+    workout_protocol = """
+    ## Nervous System Regulation Library:
+    1. Hyperarousal/Fight (High stress, anxiety, High RHR): 
+       - Goal: Grounding and soothing.
+       - Recommendation: Grounding Yoga or 4-7-8 Breathing.
     
-    User Profile:
-    - Name: {data.get('user_name')}
+    2. Freeze (Stuck energy, numbness, Low HRV):
+       - Goal: Building agency and internal power.
+       - Recommendation: Bodyweight Strength (Squats/Planks) or Power Yoga.
     
-    Current User Physiology (from Intervals.icu):
-    - HRV: {data.get('hrv')} ms
-    - Resting Heart Rate: {data.get('resting_hr')} bpm
-    - Sleep: {data.get('sleep')} hours
-    - Stress Score: {data.get('stress')}
-    - Latest Data Date: {data.get('date_found')}
-    
-    Recent History (Last 10 days):
-    {history_str}
-    
-    Last Activity:
-    - {act_info}
-    
-    User Message: "{text}"
-    
-    Task: 
-    1. Always address the user by their name: {data.get('user_name')}.
-    2. If the user asks for their metrics, provide current numbers AND mention any interesting trends from the history (e.g., "I see your HRV has been dropping over the last 3 days").
-    3. If a value is "N/A", explain that you don't have that specific metric yet.
-    4. If they are stressed or have low HRV, offer empathy and a regulation tool.
-    5. Respond in Hebrew. Short, empathetic, JSON: {{ "reply": "YOUR_MESSAGE_HERE" }}
+    3. Collapse (Extreme fatigue, shutdown, Low energy):
+       - Goal: Rhythmic activation and gentle waking.
+       - Recommendation: Seated Pilates or Rhythmic Step Aerobics.
+
+    4. Safety/Flow (Balanced metrics, Good HRV, Normal RHR):
+       - Goal: Building resilience and enjoying high energy.
+       - Recommendation: HIIT workout, Running, or a dynamic Strength session.
     """
+
+    # תפריט התערבות (Intervention Menu)
+    emergency_name = data.get('emergency_name')
+    emergency_option = f"\n• *עזרה*: שליחת הודעה ל{emergency_name} (כתוב 'עזרה')." if emergency_name else ""
+    
+    intervention_menu = f"""
+--- *תפריט עזרה (Intervention)* ---
+אני מזהה עומס במערכת. בוא/י נבחר עוגן:
+• *נשימה*: תרגיל 4-7-8 (כתוב 'נשימה').
+• *קרקוע*: תרגיל 5-4-3-2-1 (כתוב 'קרקוע').
+• *תנועה*: אימון ויסות (כתוב 'אימון').{emergency_option}
+• *הכל בסדר*: אני מרגיש/ה יותר טוב (כתוב 'בסדר').
+    """
+
+    # ניתוח פיזיולוגי מבוסס מחקר (Clinical Logic)
+    clinical_logic = """
+    1. HRV Baseline Analysis: 
+       - A drop of >15% from the 10-day average indicates Sympathetic Overload/Distress.
+       - Stable high HRV indicates Vagal Tone/Safety.
+    2. RHR (Resting Heart Rate):
+       - Elevation of >5 bpm above baseline suggests Hyperarousal or systemic stress.
+       - High nocturnal RHR is a strong 'Trauma Signature'.
+    3. Polyvagal States:
+       - Fight/Flight: High RHR + Low HRV.
+       - Freeze: Stable RHR + Extremely Low HRV + Numbness.
+       - Collapse/Hypoarousal: Low RHR + Low HRV + Fatigue.
+    """
+
+    # הגדרת משימה לפי מצב
+    is_dismissed = data.get('intervention_dismissed', False)
+    
+    if mode == "morning_analysis":
+        task_desc = f"""
+        Mode 1: Morning Analysis (09:00 AM).
+        Analyze the last 14 days vs today. Identify Polyvagal state.
+        IMPORTANT: If state is complex (Hyperarousal/Freeze) AND intervention_dismissed is False, show the Menu:
+        {intervention_menu}
+        """
+    elif mode == "evening_wind_down":
+        task_desc = f"""
+        Mode 2: Evening Wind-down (09:00 PM).
+        If stress is high AND intervention_dismissed is False, show the Menu:
+        {intervention_menu}
+        """
+    else:
+        task_desc = f"""
+        Standard Chat Mode.
+        If the user says "בסדר" or "הכל טוב", acknowledge it warmly.
+        ONLY show the Intervention Menu if you detect NEW distress OR if explicitly asked for help.
+        If intervention_dismissed is True, AVOID showing the menu.
+        """
+
+    prompt = f"""
+    Role: אסיסטנט חכם, אנושי ורגיש בשם Deep-Rest Guard.
+    
+    DATA FOR ANALYSIS (Only if relevant):
+    - Today: HRV {data.get('hrv', 'N/A')}, RHR {data.get('resting_hr', 'N/A')}, Sleep {data.get('sleep', 'N/A')}h.
+    - Last Activity: {act_info}
+    - History: {history_str}
+    
+    Instructions:
+    1. PRIORITY - ACTION KEYWORDS: 
+       - If message is "נשימה": Give clear, step-by-step 4-7-8 breathing instructions.
+       - If message is "קרקוע": Lead a 5-4-3-2-1 grounding exercise (5 things to see, 4 to touch, 3 to hear, 2 to smell, 1 to taste).
+       - If message is "אימון": 
+         1. Choose the best workout from the Regulation Library based on their metrics.
+         2. Give CLEAR, step-by-step instructions on how to perform the workout.
+         3. Explain briefly HOW it helps their current state.
+       - **In these cases, SKIP the metrics analysis and focus ONLY on the instructions and support.**
+    
+    2. STANDARD ANALYSIS (If no action keyword):
+       - Address the user by name: "היי {data.get('user_name', 'חבר')} 🤍".
+       - Compare today's metrics to history. Be insightful (e.g., "ה-HRV שלך ירד ב-15%").
+       - Give 1-2 practical tips for improvement.
+       - Offer the menu if distress is detected:
+{intervention_menu}
+    
+    3. TONE: Warm, helpful, and human. 4-6 sentences. 
+       - USE EMOJIS naturally to fit the mood (e.g., 🤍, ✨, 🧘, ⚓, 📈).
+       - Make the user feel supported and seen.
+    
+    Context: {task_desc}
+    Workout Protocol: {workout_protocol}
+    
+    User Message: "{text if text else '[Voice Note]'}"
+    JSON Output Format: {{ "reply": "YOUR_MESSAGE_HERE" }}
+    """
+    
+    contents = [prompt]
+    if audio_bytes:
+        contents.append(types.Part.from_bytes(data=audio_bytes, mime_type="audio/ogg"))
+
     try:
         res = ai_client.models.generate_content(
             model="gemini-2.0-flash-exp",
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        return json.loads(res.text).get("reply", "אני כאן איתך.")
-    except:
-        return "אני מעבד את הנתונים, מיד אענה."
+        ai_reply = json.loads(res.text).get("reply")
+        if not ai_reply:
+            return f"היי {data.get('user_name', 'חבר')}, אני כאן איתך. איך אוכל לעזור? ✨"
+        return str(ai_reply)
+    except Exception as e:
+        print(f"AI ERROR: {e}")
+        return "היי, אני מעבד את הנתונים, מיד אענה. ✨"
 
 # --- MAIN HANDLER ---
 @functions_framework.http
 def whatsapp_bot(request):
     print("=== FUNCTION STARTED ===")
     
+    # Handle Scheduled Tasks (Morning/Evening)
+    task = request.args.get("task")
+    if task:
+        users = db.collection("users").get()
+        for user_doc in users:
+            u_id = user_doc.id
+            u_data = user_doc.to_dict()
+            name = u_data.get("name", "חבר")
+            if task == "morning":
+                morning_msg = f"""
+היי {name} 🤍 בוקר טוב ✨
+
+איך עבר עליך הלילה? 🌿
+כדי שנתחיל את היום יחד, אשמח שתענה/י על 3 שאלות קצרות (1-5):
+1. איך הייתה איכות השינה שלך? 😴
+2. כמה אנרגיה יש לך הבוקר? ⚡
+3. מה רמת הדריכות/מתח בגוף? ⚓
+
+בנוסף, בצע/י סנכרון קצר עם השעון וכתוב/כתבי לי 'בוצע' כשסיימת. 🧘
+                """
+                send_wa(u_id, morning_msg.strip())
+            elif task == "evening":
+                send_wa(u_id, f"ערב טוב {name} 🌙\nזה הזמן שלנו להתחיל להוריד הילוך לקראת השינה. ✨\nאיך רמת המתח שלך כרגע מ-1 (רגוע) ועד 5 (דרוך מאוד)? ⚓")
+        return "Tasks triggered", 200
+
     if request.method == "GET":
         if request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge"), 200
@@ -234,6 +375,11 @@ def whatsapp_bot(request):
                         <input name="user_name" placeholder="השם שלך" required>
                         <input name="athlete_id" placeholder="Athlete ID (למשל i12345)" required>
                         <input name="api_key" placeholder="API Key (מפתח ארוך)" required>
+                        <div style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 10px;">
+                            <p style="font-size: 14px; color: #666;"><b>איש קשר לחירום (אופציונלי):</b></p>
+                            <input name="emergency_name" placeholder="שם איש הקשר">
+                            <input name="emergency_phone" placeholder="מספר טלפון (למשל 0501234567)">
+                        </div>
                         <button type="submit">שמור וסיים</button>
                     </form>
                     <div class="help">
@@ -256,13 +402,14 @@ def whatsapp_bot(request):
             api_key = request.form.get("api_key")
             phone = request.form.get("phone") or request.args.get("state")
             user_name = request.form.get("user_name")
-            
-            print(f"CONNECT POST: phone={phone}, athlete_id={athlete_id}, name={user_name}")
+            emergency_name = request.form.get("emergency_name")
+            emergency_phone = request.form.get("emergency_phone")
             
             if phone and api_key and athlete_id:
-                set_user_credentials(phone, api_key, athlete_id, user_name)
-                welcome_msg = f"✅ היי {user_name or ''}, החיבור הצליח! אני מתחיל לעקוב אחר המדדים שלך. איך אתה מרגיש היום?"
-                send_wa(phone, welcome_msg.strip())
+                set_user_credentials(phone, api_key, athlete_id, user_name, emergency_name, emergency_phone)
+                u_name = user_name.strip() if user_name else "חבר"
+                welcome_msg = f"✅ היי {u_name} 🤍, החיבור הצליח!\nאני מתחיל לעקוב אחר המדדים שלך ולשמור עליך. ✨"
+                send_wa(phone, welcome_msg)
                 return """
                 <html>
                 <head>
@@ -295,9 +442,76 @@ def whatsapp_bot(request):
             if not messages: return "OK", 200
 
             msg = messages[0]
-            sender, text = msg["from"], msg.get("text", {}).get("body", "").strip()
-            print(f"MESSAGE from {sender}: '{text}'")
+            sender = msg["from"]
+            msg_type = msg.get("type")
+            text = msg.get("text", {}).get("body", "").strip()
+            audio_bytes = None
 
+            print(f"MESSAGE from {sender} (type: {msg_type}): '{text}'")
+
+            user_doc = get_user_doc(sender)
+
+            # --- Handle Voice Notes ---
+            if msg_type == "audio" or msg_type == "voice":
+                media_id = msg.get("audio", {}).get("id") or msg.get("voice", {}).get("id")
+                if media_id:
+                    print(f"Downloading voice note {media_id}...")
+                    audio_bytes = download_wa_media(media_id)
+                    text = "[הודעה קולית]"
+
+            # --- Intervention Protocol: Emergency Contact ---
+            if "עזרה" in text or "עזרי" in text:
+                e_name = user_doc.get("emergency_name")
+                e_phone = user_doc.get("emergency_phone")
+                u_name = user_doc.get("name", "חבר")
+                
+                if e_phone:
+                    alert_msg = f"⚓ הודעה מ-Deep-Rest Guard: {u_name} ביקש/ה לעדכן אותך שהוא/היא נמצא/ת ברגע של עומס רגשי וזקוק/ה לתמיכה. כדאי ליצור קשר בהקדם. 🤍"
+                    send_wa(e_phone, alert_msg)
+                    send_wa(sender, f"היי {u_name}, שלחתי הודעת עדכון ל{e_name} ✨ אני כאן איתך עד שהם יענו. בוא ניקח נשימה עמוקה יחד. 🧘")
+                    return "OK", 200
+                else:
+                    send_wa(sender, f"היי {u_name}, לא הגדרת איש קשר לחירום. 🌿 שלח 'חבר' כדי שנוכל לעדכן את הפרטים יחד.")
+                    return "OK", 200
+
+            # --- Logic for Protocol 2.0 Keywords ---
+            # 0. Dismiss Intervention
+            if any(word in text for word in ["בסדר", "הכל טוב", "אני בסדר"]):
+                db.collection("users").document(_clean_id(sender)).set({
+                    "intervention_dismissed_at": datetime.date.today().isoformat()
+                }, merge=True)
+                u_name = user_doc.get("name", "חבר")
+                send_wa(sender, f"שמח לשמוע שאת/ה מרגיש/ה יותר טוב, {u_name} 🤍 אני כאן אם תצטרך/י משהו נוסף. ✨")
+                return "OK", 200
+
+            # 1. Morning "Done" (בוצע)
+            if "בוצע" in text:
+                try:
+                    intervals_data = fetch_intervals_data(sender)
+                    reply = get_ai_reply(text, intervals_data, mode="morning_analysis")
+                    send_wa(sender, reply)
+                    return "OK", 200
+                except Exception as e:
+                    print(f"Morning Error: {e}")
+                    u_name = user_doc.get("name", "חבר")
+                    send_wa(sender, f"היי {u_name} 🤍, יש עיכוב קטן בנתונים. נסה/י שוב בעוד דקה. ✨")
+                    return "OK", 200
+
+            # 2. Evening Stress Level (1-5)
+            if text in ["1", "2", "3", "4", "5"]:
+                try:
+                    intervals_data = fetch_intervals_data(sender)
+                    reply = get_ai_reply(f"רמת המתח שלי היא {text}", intervals_data, mode="evening_wind_down")
+                    send_wa(sender, reply)
+                    return "OK", 200
+                except:
+                    # Even if intervals fails, we want to respond to the stress level
+                    dummy_data = {"user_name": get_user_doc(sender).get("name", "חבר")}
+                    reply = get_ai_reply(f"רמת המתח שלי היא {text}", dummy_data, mode="evening_wind_down")
+                    send_wa(sender, reply)
+                    return "OK", 200
+            
+            # --- Standard Bot Logic ---
             if text.startswith("הגדר"):
                 parts = text.split()
                 if len(parts) >= 3:
@@ -318,14 +532,18 @@ def whatsapp_bot(request):
 
             try:
                 intervals_data = fetch_intervals_data(sender)
-                reply = get_ai_reply(text, intervals_data)
+                # Pass full user doc to ensure name and emergency info are available
+                reply = get_ai_reply(text, intervals_data, audio_bytes=audio_bytes)
                 send_wa(sender, reply)
             except Exception as e:
                 if "User not connected" in str(e):
-                    send_wa(sender, "היי! אני עדיין לא מכיר את המדדים שלך. שלח 'חבר' כדי להתחבר ל-Intervals.icu.")
+                    send_wa(sender, f"היי {user_doc.get('name', 'חבר')}, אני עדיין לא מכיר את המדדים שלך. ✨ שלח 'חבר' כדי שנתחבר יחד.")
                 else:
                     print(f"ERROR: {e}")
-                    send_wa(sender, "מצטער, יש לי תקלה קלה בגישה לנתונים. נסה שוב בעוד דקה.")
+                    # Try to reply even without intervals data if possible
+                    dummy_data = {"user_name": user_doc.get("name", "חבר"), "emergency_name": user_doc.get("emergency_name")}
+                    reply = get_ai_reply(text, dummy_data, audio_bytes=audio_bytes)
+                    send_wa(sender, reply)
 
         return "OK", 200
     except Exception as e:
