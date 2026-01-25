@@ -1,6 +1,11 @@
 functions-framework==3.*
 firebase-admin>=6.5.0
 google-genai>=0.3.0
+google-cloud-texttospeech>=2.16.0
+google-cloud-vision>=3.7.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.120.0
+elevenlabs>=1.0.0
 requests>=2.32.0
 matplotlib>=3.8.0
 pandas>=2.1.0
